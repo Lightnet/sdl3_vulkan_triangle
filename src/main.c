@@ -40,7 +40,15 @@ typedef struct {
     VkSemaphore imageAvailableSemaphore;
     VkSemaphore renderFinishedSemaphore;
     VkFence inFlightFence;
+    VkBuffer uniformBuffer;              // New: Uniform buffer
+    VkDeviceMemory uniformBufferMemory;  // New: Uniform buffer memory
+    VkDescriptorSetLayout descriptorSetLayout; // New: Descriptor set layout
+    VkDescriptorPool descriptorPool;     // New: Descriptor pool
+    VkDescriptorSet descriptorSet;       // New: Descriptor set
+    float offsetX;                       // New: Track X offset
+    float offsetY;                       // New: Track Y offset
 } VulkanContext;
+
 
 bool init_vulkan(VulkanContext *ctx) {
     // Create Vulkan instance
@@ -222,6 +230,113 @@ bool create_render_pass(VulkanContext *ctx) {
     return true;
 }
 
+bool create_descriptor_set_layout(VulkanContext *ctx) {
+    VkDescriptorSetLayoutBinding uboLayoutBinding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+        .pImmutableSamplers = NULL
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &uboLayoutBinding
+    };
+
+    VK_CHECK(vkCreateDescriptorSetLayout(ctx->device, &layoutInfo, NULL, &ctx->descriptorSetLayout));
+    return true;
+}
+
+bool create_uniform_buffer(VulkanContext *ctx) {
+    VkDeviceSize bufferSize = sizeof(float) * 2; // vec2 offset
+
+    VkBufferCreateInfo bufferInfo = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bufferSize,
+        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+
+    VK_CHECK(vkCreateBuffer(ctx->device, &bufferInfo, NULL, &ctx->uniformBuffer));
+
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(ctx->device, ctx->uniformBuffer, &memRequirements);
+
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(ctx->physicalDevice, &memProperties);
+
+    uint32_t memoryTypeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((memRequirements.memoryTypeBits & (1 << i)) &&
+            (memProperties.memoryTypes[i].propertyFlags & 
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))) {
+            memoryTypeIndex = i;
+            break;
+        }
+    }
+    if (memoryTypeIndex == UINT32_MAX) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to find suitable memory type for uniform buffer");
+        return false;
+    }
+
+    VkMemoryAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = memRequirements.size,
+        .memoryTypeIndex = memoryTypeIndex
+    };
+
+    VK_CHECK(vkAllocateMemory(ctx->device, &allocInfo, NULL, &ctx->uniformBufferMemory));
+    VK_CHECK(vkBindBufferMemory(ctx->device, ctx->uniformBuffer, ctx->uniformBufferMemory, 0));
+
+    return true;
+}
+
+bool create_descriptor_pool_and_set(VulkanContext *ctx) {
+    VkDescriptorPoolSize poolSize = {
+        .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = 1
+    };
+
+    VkDescriptorPoolCreateInfo poolInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &poolSize
+    };
+
+    VK_CHECK(vkCreateDescriptorPool(ctx->device, &poolInfo, NULL, &ctx->descriptorPool));
+
+    VkDescriptorSetAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = ctx->descriptorPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &ctx->descriptorSetLayout
+    };
+
+    VK_CHECK(vkAllocateDescriptorSets(ctx->device, &allocInfo, &ctx->descriptorSet));
+
+    VkDescriptorBufferInfo bufferInfo = {
+        .buffer = ctx->uniformBuffer,
+        .offset = 0,
+        .range = sizeof(float) * 2
+    };
+
+    VkWriteDescriptorSet descriptorWrite = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ctx->descriptorSet,
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .pBufferInfo = &bufferInfo
+    };
+
+    vkUpdateDescriptorSets(ctx->device, 1, &descriptorWrite, 0, NULL);
+    return true;
+}
+
 bool create_graphics_pipeline(VulkanContext *ctx) {
     VkShaderModule vertShaderModule;
     VkShaderModuleCreateInfo vertShaderInfo = {
@@ -319,7 +434,8 @@ bool create_graphics_pipeline(VulkanContext *ctx) {
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 0,
+        .setLayoutCount = 1,                        // Changed from 0
+        .pSetLayouts = &ctx->descriptorSetLayout,   // New
         .pushConstantRangeCount = 0
     };
 
@@ -396,6 +512,15 @@ bool create_sync_objects(VulkanContext *ctx) {
     return true;
 }
 
+bool update_uniform_buffer(VulkanContext *ctx) {
+    float offset[2] = { ctx->offsetX, ctx->offsetY };
+    void *data;
+    VK_CHECK(vkMapMemory(ctx->device, ctx->uniformBufferMemory, 0, sizeof(offset), 0, &data));
+    memcpy(data, offset, sizeof(offset));
+    vkUnmapMemory(ctx->device, ctx->uniformBufferMemory);
+    return true;
+}
+
 bool record_command_buffer(VulkanContext *ctx, uint32_t imageIndex) {
     VkCommandBufferBeginInfo beginInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -416,6 +541,7 @@ bool record_command_buffer(VulkanContext *ctx, uint32_t imageIndex) {
 
     vkCmdBeginRenderPass(ctx->commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(ctx->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ctx->graphicsPipeline);
+    vkCmdBindDescriptorSets(ctx->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ctx->pipelineLayout, 0, 1, &ctx->descriptorSet, 0, NULL);
     vkCmdDraw(ctx->commandBuffer, 3, 1, 0, 0);
     vkCmdEndRenderPass(ctx->commandBuffer);
     VK_CHECK(vkEndCommandBuffer(ctx->commandBuffer));
@@ -439,6 +565,10 @@ void cleanup(VulkanContext *ctx) {
     vkDestroyPipelineLayout(ctx->device, ctx->pipelineLayout, NULL);
     vkDestroyRenderPass(ctx->device, ctx->renderPass, NULL);
     vkDestroySwapchainKHR(ctx->device, ctx->swapchain, NULL);
+    vkDestroyDescriptorPool(ctx->device, ctx->descriptorPool, NULL);        // New
+    vkDestroyDescriptorSetLayout(ctx->device, ctx->descriptorSetLayout, NULL); // New
+    vkDestroyBuffer(ctx->device, ctx->uniformBuffer, NULL);                 // New
+    vkFreeMemory(ctx->device, ctx->uniformBufferMemory, NULL);             // New
     vkDestroyDevice(ctx->device, NULL);
     vkDestroySurfaceKHR(ctx->instance, ctx->surface, NULL);
     vkDestroyInstance(ctx->instance, NULL);
@@ -463,6 +593,9 @@ int main(int argc, char *argv[]) {
 
     if (!init_vulkan(ctx) ||
         !create_swapchain(ctx) ||
+        !create_descriptor_set_layout(ctx) ||  // New
+        !create_uniform_buffer(ctx) ||        // New
+        !create_descriptor_pool_and_set(ctx) || // New
         !create_render_pass(ctx) ||
         !create_graphics_pipeline(ctx) ||
         !create_framebuffers(ctx) ||
@@ -473,20 +606,61 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    
     bool running = true;
     SDL_Event event;
+    float moveSpeed = 0.01f; // Adjust as needed
+    bool keyState[4] = { false, false, false, false }; // W, A, S, D
+
     while (running) {
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) {
                 running = false;
+            } else if (event.type == SDL_EVENT_KEY_DOWN) {
+                switch (event.key.key) {
+                    case SDLK_W: keyState[0] = true; break;
+                    case SDLK_A: keyState[1] = true; break;
+                    case SDLK_S: keyState[2] = true; break;
+                    case SDLK_D: keyState[3] = true; break;
+                }
+            } else if (event.type == SDL_EVENT_KEY_UP) {
+                switch (event.key.key) {
+                    case SDLK_W: keyState[0] = false; break;
+                    case SDLK_A: keyState[1] = false; break;
+                    case SDLK_S: keyState[2] = false; break;
+                    case SDLK_D: keyState[3] = false; break;
+                }
             }
+        }
+
+        // Update offsets based on key states
+        if (keyState[0]) ctx->offsetY -= moveSpeed; // W: Move up
+        if (keyState[1]) ctx->offsetX -= moveSpeed; // A: Move left
+        if (keyState[2]) ctx->offsetY += moveSpeed; // S: Move down
+        if (keyState[3]) ctx->offsetX += moveSpeed; // D: Move right
+        ctx->offsetX = SDL_clamp(ctx->offsetX, -1.0f, 1.0f);
+        ctx->offsetY = SDL_clamp(ctx->offsetY, -1.0f, 1.0f);
+
+        if (!update_uniform_buffer(ctx)) {
+            cleanup(ctx);
+            free(ctx);
+            return 1;
         }
 
         vkWaitForFences(ctx->device, 1, &ctx->inFlightFence, VK_TRUE, UINT64_MAX);
         vkResetFences(ctx->device, 1, &ctx->inFlightFence);
 
         uint32_t imageIndex;
-        VK_CHECK(vkAcquireNextImageKHR(ctx->device, ctx->swapchain, UINT64_MAX, ctx->imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex));
+        VkResult result = vkAcquireNextImageKHR(ctx->device, ctx->swapchain, UINT64_MAX, ctx->imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            // Handle swapchain recreation if needed
+            continue;
+        } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to acquire swapchain image: %d", result);
+            cleanup(ctx);
+            free(ctx);
+            return 1;
+        }
 
         vkResetCommandBuffer(ctx->commandBuffer, 0);
         if (!record_command_buffer(ctx, imageIndex)) {
@@ -517,15 +691,22 @@ int main(int argc, char *argv[]) {
             .pImageIndices = &imageIndex
         };
 
-        VK_CHECK(vkQueuePresentKHR(ctx->graphicsQueue, &presentInfo));
+        result = vkQueuePresentKHR(ctx->graphicsQueue, &presentInfo);
+        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+            // Handle swapchain recreation if needed
+        } else if (result != VK_SUCCESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to present: %d", result);
+            cleanup(ctx);
+            free(ctx);
+            return 1;
+        }
     }
+
 
     cleanup(ctx);
     free(ctx);
     return 0;
 }
-
-
 
 
 //
